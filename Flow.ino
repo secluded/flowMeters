@@ -2,16 +2,19 @@
 
 // Date and time functions using a DS1307 RTC connected via I2C and Wire lib
 #include <Wire.h>
-#include "RTClib.h"
+#include <RTClib.h>
 
 #include <SPI.h>
 #include <SD.h>
 
 #include <Ethernet.h>
-#include "PubSubClient.h"
+#include <PubSubClient.h>
+#include "defines.h"
 
 #define DEBOUNCE_TIME 100
 #define NO_METERS 32
+
+
 typedef struct {
   byte pinNumber;
   unsigned long changeTime;
@@ -33,25 +36,31 @@ RTC_DS1307 rtc;
 
 EthernetClient ethClient;
 PubSubClient mqttClient;
-#define CLIENT_ID "flowTest5435"
+#define CLIENT_ID "flowMeter"
+#define USER "floodwatch"
+#define PASSWORD "floodwatch##"
 
 
 #define SD_SELECT_PIN 4
 uint8_t mac[6] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x06};
 
-
+byte errorCode=0;
 
 void init_RTC()
 {
+  errorCode+=RTC_ERROR;
   Serial.print("Initializing RTC...");
   if (! rtc.begin()) {
     Serial.println("Couldn't find RTC");
-    while (1);
+    return;
   }
-//  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-//  rtc.adjust(DateTime(2017, 1, 21, 3, 0, 0));
+
+  //rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  //  rtc.adjust(DateTime(2017, 1, 21, 3, 0, 0));
+
   if (! rtc.isrunning()) {
     Serial.println("RTC is NOT running!");
+    return;
   }
   Serial.println("RTC initialized.");
 
@@ -67,33 +76,39 @@ void init_RTC()
   Serial.print(now.minute(), DEC);
   Serial.print(':');
   Serial.println(now.second(), DEC);
+  errorCode-=RTC_ERROR;
 }
 
 void init_SD()
 {
+  errorCode+=SD_ERROR;
   Serial.print("Initializing SD card...");
 
   // see if the card is present and can be initialized:
   if (!SD.begin(SD_SELECT_PIN)) {
     Serial.println("Card failed, or not present");
+    
     // don't do anything more:
     return;
   }
   Serial.println("card initialized.");
+  errorCode-=SD_ERROR;
 }
 
-void init_MQTT()
+void init_Network()
 {
+  errorCode+=ETH_ERROR;
   // setup ethernet communication using DHCP
   if (Ethernet.begin(mac) == 0) {
     Serial.println(F("Unable to configure Ethernet using DHCP"));
-    for (;;);
+    return;
   }
-
+  
   Serial.println(F("Ethernet configured via DHCP"));
   Serial.print("IP address: ");
   Serial.println(Ethernet.localIP());
   Serial.println();
+  errorCode-=ETH_ERROR;
   /*
     Serial.println(Ethernet.localIP()[0]);
     Serial.println(Ethernet.localIP()[1]);
@@ -108,19 +123,39 @@ void init_MQTT()
   ip = ip + ".";
   ip = ip + String (Ethernet.localIP()[3]);
   //Serial.println(ip);
-
-  // setup mqtt client
-  mqttClient.setClient(ethClient);
-   mqttClient.setServer("test.mosquitto.org", 1883);
-  Serial.println(F("MQTT client configured"));
-  //mqttClient.setCallback(callback);
-  if(mqttClient.connect(CLIENT_ID)){//, USER, PASSWORD)) 
-    mqttClient.publish("flow543g", "RST");
-    Serial.println(ip);
-  }
-
 }
 
+void init_MQTT()
+{
+  errorCode+=MQTT_ERROR;
+  // setup mqtt client
+  mqttClient.setClient(ethClient);
+  mqttClient.setServer("broker.secluded.io", 1883);
+  Serial.println(F("MQTT client configured:Connecting..."));
+  //mqttClient.setCallback(callback);
+  if(mqttClient.connect(CLIENT_ID, USER, PASSWORD)) {
+    mqttClient.publish("flow/Online", "RST");
+    errorCode-=MQTT_ERROR;
+    //Serial.println(ip);
+  } 
+}
+
+void initPins()
+{
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(ORANGE_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  digitalWrite(GREEN_LED_PIN, HIGH);
+  digitalWrite(ORANGE_LED_PIN, HIGH);
+  digitalWrite(RED_LED_PIN, HIGH);
+  delay(500);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(ORANGE_LED_PIN, LOW);
+  digitalWrite(RED_LED_PIN, LOW);
+  for(byte i = 0; i < NO_METERS; i++){
+    pinMode(meter[i].pinNumber, INPUT_PULLUP);
+  }  
+}
 
 
 void setup() {
@@ -131,10 +166,9 @@ void setup() {
   while (!Serial); // for Leonardo/Micro/Zero
   init_RTC();
   init_SD();
+  init_Network();
   init_MQTT();
-  for(byte i = 0; i < NO_METERS; i++){
-    pinMode(meter[i].pinNumber, INPUT_PULLUP);
-  }
+  initPins();
 }
 
 void loop() {
@@ -145,8 +179,104 @@ void loop() {
   //appendDataToSD(5);
   mqttClient.loop();
   checkMeters();
+  handleErrors();
 }
 
+static unsigned long orangeOnTime = 0;
+byte greenDutyCycle = 100;
+byte redDutyCycle = 0;
+#define ledPulseWidth 1000
+
+void handleErrors()
+{
+  static byte lastError = 99;
+  switch(errorCode){
+    case ERR_OK:  //0 = Normal = Green ON
+      greenDutyCycle = 100;
+      redDutyCycle = 0;
+      break;
+    case ERR_RTC: //1 = No RTC = green pulse OFF flash
+      greenDutyCycle = 20;
+      redDutyCycle = 0;
+      //init_RTC();
+      break;
+    case ERR_SD:  //2 = No SD = green pulse ON flash
+      greenDutyCycle = 80;
+      redDutyCycle = 0;
+      //init_SD();
+      break;
+    case ERR_RSD: //3 = No RTC/SD = green flash
+      greenDutyCycle = 50;
+      redDutyCycle = 0;
+      break;
+    case ERR_MQTT:  //4 = No MQTT = red fast OFF flash
+      greenDutyCycle = 0;
+      redDutyCycle = 20;
+      //init_MQTT();
+      break;
+    case ERR_ETH: //8/12 = No Eth/Mqtt = red fast ON flash
+      greenDutyCycle = 0;
+      redDutyCycle = 80;
+      init_Network();
+      break;
+    case ERR_RMQTT: //5 = No MQTT/RTC = red flash
+      greenDutyCycle = 0;
+      redDutyCycle = 50;
+      break;
+    default:
+      greenDutyCycle = 0;
+      redDutyCycle = 100;
+      break;
+  }
+  updateLED();
+  if(lastError != errorCode){
+    Serial.print("ERR:");
+    Serial.println(errorCode);
+    Serial.print(greenDutyCycle);
+    Serial.print(":");
+    Serial.println(redDutyCycle);
+  }
+  lastError = errorCode;
+}
+
+void updateLED()
+{
+  static unsigned long greenOnTime = 0;
+  static unsigned long redOnTime = 0;
+  static boolean greenLEDState = LOW;
+  static boolean redLEDState = LOW;
+  if(greenDutyCycle > 0){
+    if(greenLEDState == LOW){
+      greenLEDState = HIGH;
+      greenOnTime = millis();
+    } else {
+      if(greenDutyCycle != 100 && millis()-greenOnTime > ((ledPulseWidth / 100)*greenDutyCycle)){
+        greenLEDState = LOW;
+      }
+    }
+  } else {
+    greenLEDState = LOW;
+  }
+  digitalWrite(GREEN_LED_PIN, greenLEDState);
+
+  if(redDutyCycle > 0){
+    if(redLEDState == LOW){
+      redLEDState = HIGH;
+      redOnTime = millis();
+    } else {
+      if(redDutyCycle != 100 && millis()-redOnTime > ((ledPulseWidth / 100)*redDutyCycle)){
+        redLEDState = LOW;
+      }
+    }
+  } else {
+    redLEDState = LOW;
+  }
+  digitalWrite(RED_LED_PIN, redLEDState);
+
+  if(millis() - orangeOnTime > 250){
+    digitalWrite(ORANGE_LED_PIN, LOW);
+  }
+}
 
 void checkMeters()
 {
@@ -163,7 +293,9 @@ void checkMeters()
         meter[i].btnState = btnReading;
         
         if(meter[i].btnState == LOW){
-          Serial.print(i+1);
+          Serial.println(i+1);
+          orangeOnTime = millis();
+          digitalWrite(ORANGE_LED_PIN, HIGH);
           sendPulse(i+1);
         }
       }
@@ -182,7 +314,7 @@ void sendPulse(byte pumpNumber)
   dataString += String(pumpNumber);
 
   if(mqttClient.connect(CLIENT_ID)){//, USER, PASSWORD)) 
-    mqttClient.publish("flow543g", "msg");
+    mqttClient.publish("flow", pumpNumber);
     Serial.println(dataString);
   } else {
     // open the file. note that only one file can be open at a time,

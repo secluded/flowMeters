@@ -1,4 +1,0 @@
-#define GREEN_LED_PIN 30
-#define ORANGE_LED_PIN 31
-#define RED_LED_PIN 32
-#define CONFIGURE_BTN_PIN 33
